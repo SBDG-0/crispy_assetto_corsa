@@ -1,0 +1,875 @@
+-- Crispy Driver Tags (optimized 🤡)
+
+local sim = ac.getSim()
+
+local CRISPYDRIVERTAGDEFAULTS = {
+    tagsDisabled              = false,
+    advancedSettings          = false,
+    tagW                      = 1024,
+    tagH                      = 120,
+
+    pitVisible                = true,
+    showFlag                  = true,
+    showPing                  = true,
+    flagSize                  = 46,
+    pingSize                  = 24,
+
+    tagsDistance              = 150,
+
+    nearFadeStart             = 0.76,
+    nearFadeEnd               = 0.96,
+    nearFadeMin               = 0.00,
+
+    midDistance               = 0.75,
+    hiddenDistance            = 0.40,
+
+    fontType                  = 'Verdana:@System',
+    fontSizeV                 = 40,
+    outlineThickness          = 5,
+
+    useDriverTagsColor        = true,
+    useDriverTagsColorOutline = false,
+
+    boxEnabled                = true,
+    boxPaddingX               = 12,
+    boxPaddingY               = 6,
+    boxRadius                 = 12,
+    fadingCloseToggle         = true,
+}
+
+local default_colors = {
+    boxColor     = rgbm(0.0, 0.0, 0.0, 0.96),
+    outlineColor = rgbm(0.0, 0.0, 0.0, 0.92),
+    textColor    = rgbm(0.90, 0.90, 0.90, 1.00),
+}
+
+local dc = ac.storage(default_colors)
+local st = ac.storage(CRISPYDRIVERTAGDEFAULTS)
+
+local inited = false
+
+local lastTagW = st.tagW
+local lastTagH = st.tagH
+local lastDistance = st.tagsDistance
+
+local lastFont = st.fontType
+
+local tagsDirty = true
+local tagsDirtyTimer = 0
+
+local lastValidated = {
+    nearFadeStart = st.nearFadeStart,
+    nearFadeEnd = st.nearFadeEnd,
+    midDistance = st.midDistance,
+    hiddenDistance = st.hiddenDistance
+}
+
+local carCache = {}
+local textMeasureCache = {}
+
+local function ResetColors()
+    for k, v in pairs(default_colors) do
+        dc[k] = v
+    end
+    dc.boxColor     = rgbm(0.0, 0.0, 0.0, 0.96)
+    dc.outlineColor = rgbm(0.0, 0.0, 0.0, 0.92)
+    dc.textColor    = rgbm(0.90, 0.90, 0.90, 1.00)
+end
+
+local function clamp01(x)
+    return math.clamp(x, 0, 1)
+end
+
+local function smoothstep(a, b, x)
+    if a == b then return x >= b and 1 or 0 end
+    x = clamp01((x - a) / (b - a))
+    return x * x * (3 - 2 * x)
+end
+
+local function measureDWrite(text, size)
+    if ui.measureDWriteText then return ui.measureDWriteText(text, size) end
+    if ui.measureText then return ui.measureText(text, size) end
+    return vec2(#text * size * 0.55, size * 1.2)
+end
+
+local function clearTextMeasureCache()
+    textMeasureCache = {}
+end
+
+local function clearCarCache()
+    carCache = {}
+end
+
+local function measureCached(text, size)
+    local key = st.fontType .. '|' .. tostring(size) .. '|' .. text
+    local v = textMeasureCache[key]
+    if v then return v end
+    v = measureDWrite(text, size)
+    textMeasureCache[key] = v
+    return v
+end
+
+local function validateSettings() -- performance loss here
+    st.midDistance    = math.clamp(st.midDistance, 0.25, 1.0)
+    st.hiddenDistance = math.clamp(st.hiddenDistance, 0.25, 1.0)
+
+    if st.midDistance < st.hiddenDistance then
+        st.hiddenDistance = st.midDistance
+    end
+
+    st.nearFadeStart = math.clamp(st.nearFadeStart, 0.25, 1.0)
+    st.nearFadeEnd   = math.clamp(st.nearFadeEnd, 0.25, 1.0)
+
+    if st.nearFadeEnd < st.nearFadeStart then
+        st.nearFadeEnd = st.nearFadeStart
+    end
+end
+
+local function validationInputsChanged()
+    return
+        st.nearFadeStart ~= lastValidated.nearFadeStart or
+        st.nearFadeEnd ~= lastValidated.nearFadeEnd or
+        st.midDistance ~= lastValidated.midDistance or
+        st.hiddenDistance ~= lastValidated.hiddenDistance
+end
+
+local function storeValidatedSnapshot()
+    lastValidated.nearFadeStart = st.nearFadeStart
+    lastValidated.nearFadeEnd = st.nearFadeEnd
+    lastValidated.midDistance = st.midDistance
+    lastValidated.hiddenDistance = st.hiddenDistance
+end
+
+local function markTagsDirty()
+    tagsDirty = true
+    tagsDirtyTimer = 0.10
+end
+
+local function formatPing(ping)
+    if not ping or ping <= 0 then
+        return "", rgbm(1, 1, 1, 1)
+    end
+
+    local color = rgbm(1, 1, 1, 1)
+    local emoji = "•" -- PING ICON HERE
+
+    if ping > 200 then
+        emoji = "⚠️"
+        color = rgbm(1, 0, 0, 1)
+    elseif ping > 165 then
+        emoji = "⚠️"
+        color = rgbm(1, 0.25, 0, 1)
+    elseif ping > 135 then
+        emoji = "•"
+        color = rgbm(1, 0.5, 0, 1)
+    elseif ping > 100 then
+        emoji = "•"
+        color = rgbm(1, 0.75, 0, 1)
+    elseif ping > 80 then
+        color = rgbm(1, 1, 0, 1)
+    elseif ping > 50 then
+        color = rgbm(1, 1, 0.5, 1)
+    end
+
+    return string.format("%s %dms", emoji, ping), color
+end
+
+local function _unpackRGB(c)
+    if not c then return nil end
+    local r = c.r or c.x or c[1]
+    local g = c.g or c.y or c[2]
+    local b = c.b or c.z or c[3]
+    if r and g and b then return r, g, b end
+    return nil
+end
+
+local function buildFlagPath(code)
+    if not code or code == "" then return nil end
+    if code == "PLA" then code = "AC" end
+    return "/content/gui/NationFlags/" .. string.upper(code) .. ".png"
+end
+
+local KNOWN_TAG_ICONS = {
+    STREAMER = { image = "/img/twitch-ico.png" },
+    COOL_KID = { image = "/img/discord-ico.png" },
+    ADMIN = { image = "/img/admin-ico.png" },
+    TTV = { alias = "STREAMER" },
+    DRIFT_KING = { alias = "COOL_KID" },
+    BAD_DRIVER = { alias = "COOL_KID" },
+    ANGLE_MASTER = { alias = "COOL_KID" },
+    -- TEAM = { image = "imgpath", scale = 1.0 , w = 50 , h = 40 },
+}
+
+local function trim(s)
+    return (s and s:match("^%s*(.-)%s*$")) or ""
+end
+
+local function normalizeTagKey(tag)
+    return (tag or ''):upper():gsub('^%s+', ''):gsub('%s+$', ''):gsub('[%s%-]+', '_'):gsub('[^%w_]', '')
+end
+
+local function resolveTagIconDefinition(tagKey)
+    local def = KNOWN_TAG_ICONS[tagKey]
+    if def and def.alias then
+        def = KNOWN_TAG_ICONS[def.alias]
+    end
+    if not def then return nil end
+
+    if type(def) == 'string' then
+        return { kind = 'text', text = def }
+    end
+
+    if type(def) ~= 'table' then return nil end
+
+    if def.text and def.text ~= '' then
+        return {
+            kind = 'text',
+            text = def.text,
+            scale = def.scale
+        }
+    end
+
+    if def.image and def.image ~= '' then
+        return {
+            kind = 'image',
+            path = def.image,
+            w = def.w,
+            h = def.h,
+            scale = def.scale
+        }
+    end
+
+    return nil
+end
+
+local function getIconItemSize(icon, nameSizePx)
+    if not icon then return 0, 0 end
+    if icon.kind == 'text' then
+        local scale = icon.scale or 1.0
+        local textSizePx = math.max(1, math.floor(nameSizePx * scale + 0.5))
+        local size = measureCached(icon.text or '', textSizePx)
+        return size.x, size.y, textSizePx
+    end
+
+    local scale = icon.scale or 1.0
+    local base = math.max(1, math.floor(nameSizePx * scale + 0.5))
+    local w = icon.w or base
+    local h = icon.h or base
+    return w, h, nil
+end
+
+local function parseDriverName(rawName)
+    local iconItems = {}
+
+    local cleaned = (rawName or ''):gsub('%b[]', function(tagBlock)
+        local inner = trim(tagBlock:sub(2, -2))
+        local tagKey = normalizeTagKey(inner)
+        local iconDef = resolveTagIconDefinition(tagKey)
+
+        if iconDef then
+            iconItems[#iconItems + 1] = iconDef
+            return ''
+        end
+
+        return tagBlock
+    end)
+
+    cleaned = trim(cleaned):gsub('%s+', ' ')
+
+    return {
+        rawName = rawName or '',
+        displayName = cleaned,
+        iconItems = iconItems
+    }
+end
+
+local function getCarCache(index)
+    local c = carCache[index]
+    if c then return c end
+
+    local name = ac.getDriverName(index) or ""
+    local nationCode = ac.getDriverNationCode(index)
+    local tagColor = nil
+
+    if name ~= "" and ac.DriverTags then
+        local tags = ac.DriverTags(name)
+        if tags and tags.color then
+            local r, g, b = _unpackRGB(tags.color)
+            if r and g and b then
+                tagColor = rgbm(r, g, b, 1)
+            end
+        end
+    end
+
+    local parsedName = parseDriverName(name)
+    local rawName = parsedName.rawName
+    local cleanName = parsedName.displayName
+    local nation = nationCode
+
+    local hash = ac.checksumSHA256(cleanName .. nation)
+
+    if hash == "d02359554bb46f56c0ebd63f7c6ec063a198c0e107a11cbaf5e885be83c3023f"
+        or hash == "c6f257c097d0c59f879b074b3817a28edba7868c95619c7a7945dc3e3f353830" then
+        tagColor = rgbm(0.4, 0.5, 1, 1)
+    end
+
+    c = {
+        rawName = rawName,
+        name = cleanName,
+        iconItems = parsedName.iconItems,
+
+        flagPath = buildFlagPath(nationCode),
+        hasCustomIcon = ac.isCustomIconSet(index),
+
+        lastPingRounded = -9999,
+        pingText = "",
+        pingColor = rgbm(1, 1, 1, 1),
+
+        tagColor = tagColor
+    }
+
+
+    carCache[index] = c
+    return c
+end
+
+local connectionState = {}
+
+local function invalidateCarCache(index)
+    carCache[index] = nil
+end
+
+local function rebuildCarCache(index)
+    invalidateCarCache(index)
+    return getCarCache(index)
+end
+
+local function refreshConnectionStates()
+    for i = 0, sim.carsCount - 1 do
+        local car = ac.getCar(i)
+        if car then
+            local isConnected = car.isConnected == true
+            local wasConnected = connectionState[i]
+
+            if wasConnected ~= isConnected then
+                connectionState[i] = isConnected
+
+                if isConnected then
+                    rebuildCarCache(i)
+                else
+                    invalidateCarCache(i)
+                end
+            elseif isConnected then -- performance loss here
+                local cached = carCache[i]
+                local liveName = ac.getDriverName(i) or ""
+
+                if not cached or cached.rawName ~= liveName then
+                    rebuildCarCache(i)
+                else
+                    local liveTagColor = nil
+
+                    if liveName ~= "" and ac.DriverTags then
+                        local tags = ac.DriverTags(liveName)
+                        if tags and tags.color then
+                            local r, g, b = _unpackRGB(tags.color)
+                            if r and g and b then
+                                liveTagColor = rgbm(r, g, b, 1)
+                            end
+                        end
+                    end
+
+                    local sameColor =
+                        (cached.tagColor == nil and liveTagColor == nil) or
+                        (cached.tagColor ~= nil and liveTagColor ~= nil
+                            and cached.tagColor.r == liveTagColor.r
+                            and cached.tagColor.g == liveTagColor.g
+                            and cached.tagColor.b == liveTagColor.b)
+
+                    if not sameColor then
+                        clearCarCache()
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function updatePingCache(c, pingValue)
+    local rounded = math.floor((pingValue or 0) + 0.5)
+    if rounded == c.lastPingRounded then return end
+
+    c.lastPingRounded = rounded
+    c.pingText, c.pingColor = formatPing(rounded)
+end
+
+local function getNameColor(c, alpha)
+    if st.useDriverTagsColor and c.tagColor then
+        return rgbm(c.tagColor.r, c.tagColor.g, c.tagColor.b, alpha)
+    end
+    return rgbm(dc.textColor.r, dc.textColor.g, dc.textColor.b, dc.textColor.mult * alpha)
+end
+
+local function getOutlineColor(c, alpha)
+    if st.useDriverTagsColorOutline and c.tagColor then
+        return rgbm(c.tagColor.r, c.tagColor.g, c.tagColor.b, alpha)
+    end
+    return rgbm(dc.outlineColor.r, dc.outlineColor.g, dc.outlineColor.b, dc.outlineColor.mult * alpha)
+end
+
+local function drawTag(c, nameSizePx, alpha) -- performance loss here
+    local tagSize = vec2(st.tagW, st.tagH)
+    local center = vec2(tagSize.x * 0.5, tagSize.y * 0.5)
+
+    ui.pushDWriteFont(st.fontType)
+
+    local flagW, flagH = 0, 0
+    local drawFlag = false
+
+    if st.showFlag then
+        if c.hasCustomIcon then
+            drawFlag = true
+            flagW, flagH = st.flagSize, st.flagSize
+        elseif c.flagPath then
+            drawFlag = true
+            flagW, flagH = st.flagSize, st.flagSize
+        end
+    end
+
+    local pingText = ""
+    local pingColor = rgbm(1, 1, 1, 1)
+    if st.showPing and sim.isOnlineRace then
+        pingText = c.pingText
+        pingColor = c.pingColor
+    end
+
+    local nameTextSize = measureCached(c.name, nameSizePx)
+    local pingSizePx = st.pingSize
+    local pingTextSize = (pingText ~= "" and measureCached(pingText, pingSizePx)) or vec2(0, 0)
+    local gap = 10
+
+    local iconItems = c.iconItems or {}
+    local iconLayout = {}
+    local iconsW = 0
+    local iconsH = 0
+
+    for i = 1, #iconItems do
+        local icon = iconItems[i]
+        local w, h, textSizePx = getIconItemSize(icon, nameSizePx)
+        iconLayout[i] = {
+            icon = icon,
+            w = w,
+            h = h,
+            textSizePx = textSizePx
+        }
+        iconsW = iconsW + w
+        if i > 1 then iconsW = iconsW + gap end
+        iconsH = math.max(iconsH, h)
+    end
+
+    local contentW = nameTextSize.x
+    if drawFlag then contentW = contentW + flagW + gap end
+    if #iconLayout > 0 then contentW = contentW + gap + iconsW end
+    if pingText ~= "" then contentW = contentW + gap + pingTextSize.x end
+
+    local contentH = math.max(nameTextSize.y, flagH, pingTextSize.y, iconsH)
+    local pad = vec2(st.boxPaddingX, st.boxPaddingY)
+
+    local boxMin = center - vec2(contentW, contentH) * 0.5 - pad
+    local boxMax = center + vec2(contentW, contentH) * 0.5 + pad
+
+    if st.boxEnabled then
+        ui.drawRectFilled(
+            boxMin,
+            boxMax,
+            rgbm(dc.boxColor.r, dc.boxColor.g, dc.boxColor.b, dc.boxColor.mult * alpha),
+            st.boxRadius
+        )
+    end
+
+    local x = center.x - contentW * 0.5
+    local y = center.y - contentH * 0.5
+
+    if drawFlag then
+        local p1 = vec2(x, y + (contentH - flagH) * 0.5)
+        local p2 = vec2(x + flagW, y + (contentH + flagH) * 0.5)
+
+        if c.hasCustomIcon then
+            ui.drawImage('car' .. c.index .. '::special::driver', p1, p2, rgbm(1, 1, 1, alpha))
+        else
+            ui.drawImage(c.flagPath, p1, p2, rgbm(1, 1, 1, alpha))
+        end
+
+        x = x + flagW + gap
+    end
+
+    local nameColor = getNameColor(c, alpha)
+    local outlineColor = getOutlineColor(c, alpha)
+
+    ui.setCursor(vec2(x, y + (contentH - nameTextSize.y) * 0.5))
+    ui.beginOutline()
+    ui.dwriteText(c.name, nameSizePx, nameColor)
+    ui.endOutline(outlineColor, st.outlineThickness)
+
+    x = x + nameTextSize.x
+
+    if #iconLayout > 0 then
+        x = x + gap
+        for i = 1, #iconLayout do
+            local item = iconLayout[i]
+            local icon = item.icon
+            local top = y + (contentH - item.h) * 0.5
+
+            if icon.kind == 'image' then
+                ui.drawImage(icon.path, vec2(x, top), vec2(x + item.w, top + item.h), nameColor)
+            else
+                ui.setCursor(vec2(x, top))
+                ui.beginOutline()
+                ui.dwriteText(icon.text, item.textSizePx or nameSizePx, nameColor)
+                ui.endOutline(outlineColor, st.outlineThickness)
+            end
+
+            x = x + item.w
+            if i < #iconLayout then
+                x = x + gap
+            end
+        end
+    end
+
+    if pingText ~= "" then
+        x = x + gap
+        ui.setCursor(vec2(x, y + (contentH - pingTextSize.y) * 0.5))
+        ui.beginOutline()
+        ui.dwriteText(pingText, pingSizePx, rgbm(pingColor.r, pingColor.g, pingColor.b, alpha))
+        ui.endOutline(outlineColor, st.outlineThickness)
+    end
+
+    ui.popDWriteFont()
+end
+
+local function drawNameTag(car)
+    if not st.advancedSettings then
+        if car.index == sim.focusedCar then return end
+        if not car.isConnected then return end
+    end
+
+    if not st.pitVisible then
+        if car.isInPit or car.isInPitlane then return end
+    end
+
+    local dist = car.distanceToCamera
+    if dist <= 0 or dist > st.tagsDistance then return end
+
+    local c = getCarCache(car.index)
+    if not c or (c.name == "" and #(c.iconItems or {}) == 0) then return end
+
+    if st.showPing and sim.isOnlineRace then
+        updatePingCache(c, car.ping)
+    end
+
+    local t = 1 - (dist / st.tagsDistance)
+    t = clamp01(t) ^ 0.9
+
+    if t < st.hiddenDistance then return end
+
+    local alphaFar = smoothstep(st.hiddenDistance, st.midDistance, t)
+    local nearT = smoothstep(st.nearFadeStart, st.nearFadeEnd, t)
+    local alphaNear = 1 - nearT
+
+    if st.fadingCloseToggle then
+        alphaNear = math.max(st.nearFadeMin, alphaNear)
+    else
+        alphaNear = 1
+    end
+
+    local alpha = alphaFar * alphaNear
+    if alpha <= 0.02 then return end
+
+    local fontSize = (t >= st.midDistance) and st.fontSizeV or st.fontSizeV - 6
+
+    c.index = car.index
+    drawTag(c, fontSize, alpha)
+end
+
+--BLACKLIST TAGS BY SERVER IP
+local function registerTags()
+    if ac.getServerIP() == "65.108.176.35" then return end
+    ui.onDriverNameTag(true, rgbm(1, 1, 1, 0), drawNameTag, {
+        distanceMultiplier = math.ceil(st.tagsDistance / 10),
+        tagSize = vec2(st.tagW, st.tagH)
+    })
+end
+
+local updateCheckTimer = 0
+local updateCheckInterval = 0.25
+
+function script.update(dt)
+    if st.tagsDisabled then return end
+
+    dt = dt or 0
+
+    updateCheckTimer = updateCheckTimer - dt
+    if updateCheckTimer <= 0 then
+        updateCheckTimer = updateCheckInterval
+
+        refreshConnectionStates()
+
+        if validationInputsChanged() then
+            validateSettings()
+            storeValidatedSnapshot()
+        end
+    end
+    if st.fontType ~= lastFont then
+        lastFont = st.fontType
+        clearTextMeasureCache()
+    end
+    if not inited and sim.driverNamesShown then
+        validateSettings()
+        storeValidatedSnapshot()
+        registerTags()
+        inited = true
+        tagsDirty = false
+        lastTagW, lastTagH, lastDistance = st.tagW, st.tagH, st.tagsDistance
+        return
+    end
+
+    if inited then
+        if st.tagW ~= lastTagW or st.tagH ~= lastTagH or st.tagsDistance ~= lastDistance then
+            markTagsDirty()
+        end
+    end
+
+    if tagsDirty then
+        tagsDirtyTimer = tagsDirtyTimer - dt
+        if tagsDirtyTimer <= 0 then
+            registerTags()
+            lastTagW, lastTagH, lastDistance = st.tagW, st.tagH, st.tagsDistance
+            tagsDirty = false
+        end
+    end
+end
+
+function script.windowMain()
+    local w2 = (ui.availableSpaceX() - 4) / 2
+    local w3 = (ui.availableSpaceX() - 8 + 55) / 3
+    local w6 = (ui.availableSpaceX() - 4 * 5) / 4
+    local w1 = (ui.availableSpaceX() - 30)
+
+    ui.beginOutline()
+    ui.textColored('Driver tags settings', rgbm(0.9, 0.9, 1, 1))
+    ui.sameLine(w1)
+
+    if ui.button('Reset') then
+        for k, v in pairs(CRISPYDRIVERTAGDEFAULTS) do
+            st[k] = v
+        end
+        lastTagW, lastTagH, lastDistance = -1, -1, -1
+        lastFont = st.fontType
+        validateSettings()
+        storeValidatedSnapshot()
+        clearTextMeasureCache()
+        clearCarCache()
+        markTagsDirty()
+        ResetColors()
+        refreshConnectionStates()
+    end
+
+    ui.tabBar('someCrispyTabBarID', function()
+        ui.tabItem('General', function()
+            ui.text('Info')
+            ui.setNextItemWidth(w3)
+            if ui.checkbox('Show flag', st.showFlag) then
+                st.showFlag = not st.showFlag
+            end
+
+            ui.sameLine()
+            ui.setNextItemWidth(w3 + 28)
+            st.flagSize = ui.slider('##Flag size', st.flagSize, 24, 72, 'Flag size: %.0fpx')
+
+            ui.setNextItemWidth(w3)
+            if ui.checkbox('Show ping', st.showPing) then
+                st.showPing = not st.showPing
+            end
+
+            ui.sameLine()
+            ui.setNextItemWidth(w3 + 28)
+            st.pingSize = ui.slider('##Ping size', st.pingSize, 24, 42, 'Ping size: %.0fpx')
+
+            if ui.checkbox('Show background box', st.boxEnabled) then
+                st.boxEnabled = not st.boxEnabled
+            end
+            if ui.itemHovered() then
+                ui.setTooltip('Render background box behind driver tags')
+            end
+
+            if ui.checkbox('Enable Close Range Fading', st.fadingCloseToggle) then
+                st.fadingCloseToggle = not st.fadingCloseToggle
+            end
+            if ui.itemHovered() then
+                ui.setTooltip('Toggle the vicinity based fading of nametags')
+            end
+
+            if ui.checkbox('Show cars in pits', st.pitVisible) then
+                st.pitVisible = not st.pitVisible
+            end
+
+            ui.text('Visibility')
+            ui.setNextItemWidth(w1)
+            st.tagsDistance = ui.slider('##Distance', st.tagsDistance, 100, 800, 'Distance: %.0f m')
+            if ui.itemHovered() then
+                ui.setTooltip(
+                    'How far tags are visible, this is the base value all other options are calculated from. Keep in mind changes to the fade tab are tied together to this visibility distance!')
+            end
+        end)
+
+        ui.tabItem('Fade', function()
+            ui.text('Driver Tag fading adjustments')
+            if ui.itemHovered() then
+                ui.setTooltip('Relative to distance from player at close range')
+            end
+
+            ui.setNextItemWidth(w1)
+            st.nearFadeStart = ui.slider('##fade start', st.nearFadeStart, 0.25, 1.0, 'Fade start: %.2f')
+            if ui.itemHovered() then
+                ui.setTooltip('l→ How far out cars have to be for tags to fade')
+            end
+
+            ui.setNextItemWidth(w1)
+            st.nearFadeEnd = ui.slider('##fade end', st.nearFadeEnd, 0.25, 1.0, 'Fade end: %.2f')
+            if ui.itemHovered() then
+                ui.setTooltip('→l How close cars have to be for tags to fade')
+            end
+
+            ui.setNextItemWidth(w1)
+            st.nearFadeMin = ui.slider('##min alpha', st.nearFadeMin, 0.0, 1.0, 'Minimum opacity: %.2f')
+
+            ui.newLine(-5)
+            ui.text('Distance multiplier adjustments')
+            if ui.itemHovered() then
+                ui.setTooltip(
+                    'Directly affects fading adjustments and is affected by visibility distance. Be aware, the adjustments on these sliders change depending on how you set up max distance. HIGHER max visibility = MORE sensitive input.')
+            end
+
+            ui.setNextItemWidth(w1)
+            st.midDistance = ui.slider('##medium', st.midDistance, 0.25, 1.0, 'Mult. medium range: %.2f')
+            if ui.itemHovered() then
+                ui.setTooltip(
+                    'Multiplier for distance used as cutoff point. The fading, for tags that are far, begins with this and fades until it hits the set far distance below.')
+            end
+
+            ui.setNextItemWidth(w1)
+            st.hiddenDistance = ui.slider('##far/hidden', st.hiddenDistance, 0.25, 1.0, 'Mult. fade distance: %.2f')
+            if ui.itemHovered() then
+                ui.setTooltip('Multiplier for distance considered far from player')
+            end
+        end)
+
+        ui.tabItem('Text', function()
+            ui.text('Font Style')
+            ui.setNextItemWidth(w1)
+            st.fontType = ui.inputText('##Font Path', st.fontType)
+            if ui.itemHovered() then
+                ui.setTooltip('Set a custom font path here or use a different system font.')
+            end
+
+            ui.text('Font Size')
+            ui.setNextItemWidth(w1)
+            st.fontSizeV = ui.slider('##SizeF', st.fontSizeV, 24, 56, 'Font Size: %.0fpx')
+
+            ui.newLine(2)
+            ui.text('Name color source')
+
+            if ui.checkbox('DriverTags color', st.useDriverTagsColor) then
+                st.useDriverTagsColor = not st.useDriverTagsColor
+            end
+            if ui.itemHovered() then
+                ui.setTooltip('Uses ac.DriverTags(name).color if available')
+            end
+            if not st.useDriverTagsColor then
+                ui.sameLine(w1 - 38)
+                ui.colorButton("Text", dc.textColor,
+                    bit.bor(ui.ColorPickerFlags.AlphaBar, ui.ColorPickerFlags.AlphaPreview,
+                        ui.ColorPickerFlags.PickerHueBar))
+            end
+
+            if ui.checkbox('DriverTags color as outline', st.useDriverTagsColorOutline) then
+                st.useDriverTagsColorOutline = not st.useDriverTagsColorOutline
+            end
+            if ui.itemHovered() then
+                ui.setTooltip('Uses ac.DriverTags(name).color if available')
+            end
+            if not st.useDriverTagsColorOutline then
+                ui.sameLine(w1 - 38)
+                ui.colorButton("Outline", dc.outlineColor,
+                    bit.bor(ui.ColorPickerFlags.AlphaBar, ui.ColorPickerFlags.AlphaPreview,
+                        ui.ColorPickerFlags.PickerHueBar))
+            end
+
+            ui.newLine(2)
+            if ui.button('Reset Colors') then
+                ResetColors()
+                st.useDriverTagsColor = true
+                st.useDriverTagsColorOutline = false
+                clearCarCache()
+            end
+
+            ui.sameLine(w3 + 6)
+            ui.setNextItemWidth(w3 + 14)
+            st.outlineThickness = ui.slider('##Outline Thickness', st.outlineThickness, 0, 5, 'Outline Width: %.1f')
+        end)
+
+        if st.boxEnabled then
+            ui.tabItem('Box', function()
+                ui.text('Box customization')
+                ui.colorButton("Box Color", dc.boxColor,
+                    bit.bor(ui.ColorPickerFlags.AlphaBar, ui.ColorPickerFlags.AlphaPreview,
+                        ui.ColorPickerFlags.PickerHueBar))
+                ui.sameLine()
+                ui.text('Box Color')
+
+                st.boxPaddingX = ui.slider('##Padding X', st.boxPaddingX, 2, 64, 'Padding X: %.0fpx')
+                st.boxPaddingY = ui.slider('##Padding Y', st.boxPaddingY, 2, 22, 'Padding Y: %.0fpx')
+                st.boxRadius = ui.slider('##Radius', st.boxRadius, 0, 64, 'Roundness: %.0fpx')
+            end)
+        end
+
+        ui.tabItem('Misc', function()
+            ui.newLine(-10)
+            if ui.button('Clear/Refresh Car Cache') then
+                clearCarCache()
+            end
+            if ui.checkbox('Enable Debug Settings', st.advancedSettings) then
+                st.advancedSettings = not st.advancedSettings
+            end
+            if ui.itemHovered() then
+                ui.setTooltip('Display additional settings + Show your own Nametag')
+            end
+            if st.advancedSettings then
+                if ui.checkbox(' Disable App (read tooltip)', st.tagsDisabled) then
+                    st.tagsDisabled = not st.tagsDisabled
+                end
+                if ui.itemHovered() then
+                    ui.setTooltip(
+                        'This does not work as intended, due to missing functions in csp, to apply this change you need to tick this box and reload your game/session')
+                end
+            end
+            
+            ui.textColored('made by SavageBulldogOG', rgbm(0.7, 0.7, 1, 1))
+            if ui.itemHovered() then
+                ui.setTooltip(
+                    'Imagine putting a patreon link here and telling people to check you out. The Audacity! Whatever I will do it anyway 🤡. You can find and punish me by joining the free tier at → patreon.com/SB618 ← much love 🫶')
+            end
+        end)
+    end)
+    -- for i = 0, sim.carsCount - 1 do
+    --     local car = ac.getCar(i)
+    --     if car then
+    --         ui.text(string.format(
+    --             "#%d | %s | %s",
+    --             i,
+    --             ac.getDriverName(i) or "nil",
+    --             tostring(ac.getDriverNationCode(i))
+    --         ))
+    --     end
+    -- end
+    ui.endOutline(rgbm.colors.black)
+end

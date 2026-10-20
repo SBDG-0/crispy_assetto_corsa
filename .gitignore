@@ -1,0 +1,4 @@
+# Ignore everything except this allowlist and crispy_ app folders.
+/*
+!/.gitignore
+!/crispy_*/
